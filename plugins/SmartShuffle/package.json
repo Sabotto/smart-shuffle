@@ -1,0 +1,11 @@
+{
+	"name": "@sabotto/smart-shuffle",
+	"description": "Replaces TIDAL's shuffle with a more random and customizable shuffle.",
+	"version": "1.0.0",
+	"author": {
+		"name": "Sabotto",
+		"url": "https://github.com/Sabotto"
+	},
+	"main": "./src/index.ts",
+	"type": "module"
+}

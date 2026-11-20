@@ -1,0 +1,32 @@
+{
+	"name": "@sabotto/smart-shuffle-store",
+	"description": "True & Smart Shuffle plugin store for TidaLuna",
+	"author": {
+		"name": "Sabotto",
+		"url": "https://github.com/Sabotto"
+	},
+	"homepage": "https://github.com/Sabotto/smart-shuffle",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/Sabotto/smart-shuffle.git"
+	},
+	"license": "GPL-3.0",
+	"type": "module",
+	"scripts": {
+		"watch": "concurrently \"pnpm:build --watch\" pnpm:serve",
+		"build": "rimraf ./dist && tsx esbuild.config.ts",
+		"serve": "http-server ./dist -p 3000 -s --cors -c-1"
+	},
+	"devDependencies": {
+		"@types/node": "^25.0.9",
+		"@types/react": "^19.2.8",
+		"@types/react-dom": "^19.2.3",
+		"concurrently": "^9.2.1",
+		"http-server": "^14.1.1",
+		"luna": "github:Inrixia/TidaLuna",
+		"oby": "^15.1.2",
+		"rimraf": "^6.1.2",
+		"tsx": "^4.21.0",
+		"typescript": "^5.9.3"
+	}
+}
