@@ -63,9 +63,9 @@ export function Settings() {
           }}
         >
           <option value="true_random">True Random (Uniform Fisher-Yates)</option>
-          <option value="smart_shuffle">Smart Shuffle (Spotify style with Recs)</option>
-          <option value="least_played">Least Played First</option>
-          <option value="most_played">Most Played First</option>
+          <option value="smart_shuffle">Smart Shuffle (recommendations not available yet, acts as True Random)</option>
+          <option value="least_played">Least Played First (counts plays since install)</option>
+          <option value="most_played">Most Played First (counts plays since install)</option>
           <option value="fun">Fun Mode (Artist Separated)</option>
         </select>
       </div>

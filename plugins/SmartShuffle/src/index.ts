@@ -1,112 +1,107 @@
 import type { LunaUnload } from '@luna/core';
+import { PlayState, redux } from '@luna/lib';
 import { ShuffleEngine, Track } from './shuffleEngine';
 import { Settings, pluginSettings } from './Settings';
 
 // Luna calls everything in this set when the plugin is disabled/reloaded.
 export const unloads = new Set<LunaUnload>();
 
-export class TrueShufflePlugin {
-  public async onLoaded() {
-    console.log('[TrueShuffle] Plugin initialized with React Settings component.');
-    this.patchQueueController();
-  }
+export { Settings };
 
-  private patchQueueController() {
-    const playerStore = (window as any).Tidal?.PlayerStore || (window as any)._tidalStore;
+const PLAY_COUNTS_KEY = 'smart_shuffle_play_counts';
 
-    if (!playerStore) {
-      console.warn('[TrueShuffle] Player store not found directly.');
-      return;
-    }
-
-    if (typeof playerStore.setQueue !== 'function') {
-      console.warn('[TrueShuffle] playerStore.setQueue not found, shuffle not patched.');
-      return;
-    }
-
-    const self = this;
-    const originalSetQueue = playerStore.setQueue;
-
-    playerStore.setQueue = async function (args: { playlistId: string; tracks: Track[]; isShuffled: boolean }) {
-      if (args.isShuffled && args.tracks && args.tracks.length > 0) {
-        const fullPlaylistTracks = await self.fetchAllPlaylistTracks(args.playlistId, args.tracks);
-        args.tracks = await self.processShuffleMode(fullPlaylistTracks);
-      }
-      return originalSetQueue.apply(this, [args]);
-    };
-
-    // Restore the original function when the plugin unloads so reloads don't stack patches.
-    unloads.add(() => {
-      playerStore.setQueue = originalSetQueue;
-    });
-  }
-
-  private async fetchAllPlaylistTracks(playlistId: string, currentTracks: Track[]): Promise<Track[]> {
-    if (currentTracks.length < 100) return currentTracks;
-
-    try {
-      const lunaApi = (window as any).Luna?.API || (window as any).neptune?.actions;
-      if (lunaApi?.getPlaylistTracks) {
-        const response = await lunaApi.getPlaylistTracks(playlistId, { limit: 10000 });
-        return response.items || currentTracks;
-      }
-      return currentTracks;
-    } catch (err) {
-      console.error('[TrueShuffle] Failed to fetch full playlist tracks.', err);
-      return currentTracks;
-    }
-  }
-
-  private async processShuffleMode(tracks: Track[]): Promise<Track[]> {
-    const mode = pluginSettings.mode;
-
-    switch (mode) {
-      case 'true_random':
-        return ShuffleEngine.trueRandom(tracks);
-
-      case 'least_played':
-        return ShuffleEngine.weightedShuffle(tracks, 'least_played', pluginSettings.playCountExponent);
-
-      case 'most_played':
-        return ShuffleEngine.weightedShuffle(tracks, 'most_played', pluginSettings.playCountExponent);
-
-      case 'fun':
-        return ShuffleEngine.funShuffle(tracks, pluginSettings.artistSpacing);
-
-      case 'smart_shuffle':
-        return await ShuffleEngine.smartShuffle(
-          tracks,
-          async (samples) => {
-            try {
-              const lunaApi = (window as any).Luna?.API || (window as any).neptune?.actions;
-              if (lunaApi?.getRecommendations) {
-                const trackIds = samples.map(s => s.id).join(',');
-                const recs = await lunaApi.getRecommendations({ trackIds, limit: 10 });
-                return recs.items || [];
-              }
-            } catch (e) {
-              console.error('[TrueShuffle] Recommendation fetch error:', e);
-            }
-            return [];
-          },
-          pluginSettings.smartShuffleRatio,
-          pluginSettings.smartSampleSize
-        );
-
-      default:
-        return ShuffleEngine.trueRandom(tracks);
-    }
-  }
-
-  public onUnload() {
-    console.log('[TrueShuffle] Plugin unloaded.');
+// Tidal's track data has no personal play count, so we count plays ourselves (only plays since install).
+function getPlayCounts(): Record<string, number> {
+  try {
+    return JSON.parse(localStorage.getItem(PLAY_COUNTS_KEY) || '{}');
+  } catch {
+    return {};
   }
 }
 
-// Export the Settings component so the client UI can render it under the plugin card
-export { Settings };
+function toTrack(mediaItemId: string, counts: Record<string, number>): Track {
+  const item = (redux.store.getState().content.mediaItems as Record<string, any>)[mediaItemId]?.item;
+  return {
+    id: String(mediaItemId),
+    title: item?.title ?? '',
+    artist: item?.artist?.name ?? item?.artists?.[0]?.name ?? '',
+    playCount: counts[String(mediaItemId)] ?? 0,
+  };
+}
 
-const plugin = new TrueShufflePlugin();
-plugin.onLoaded().catch((err) => console.error('[TrueShuffle] Failed to initialise.', err));
+function reorder(tracks: Track[]): Track[] {
+  switch (pluginSettings.mode) {
+    case 'least_played':
+      return ShuffleEngine.weightedShuffle(tracks, 'least_played', pluginSettings.playCountExponent);
+    case 'most_played':
+      return ShuffleEngine.weightedShuffle(tracks, 'most_played', pluginSettings.playCountExponent);
+    case 'fun':
+      return ShuffleEngine.funShuffle(tracks, pluginSettings.artistSpacing);
+    case 'smart_shuffle':
+      // No recommendation API found in Luna, so this mode currently falls back to true random.
+      return ShuffleEngine.trueRandom(tracks);
+    case 'true_random':
+    default:
+      return ShuffleEngine.trueRandom(tracks);
+  }
+}
 
-export default plugin;
+/**
+ * Tidal shuffles the queue itself (seeded). When that happens we take the queue
+ * after the current track and re-order it with the selected algorithm.
+ */
+function applyCustomShuffle() {
+  const pq = PlayState.playQueue;
+  if (!pq.shuffleModeEnabled) return;
+
+  const head = pq.elements.slice(0, pq.currentIndex + 1); // keep history + current track untouched
+  const tail = pq.elements.slice(pq.currentIndex + 1);
+  if (tail.length < 2) return;
+
+  const counts = getPlayCounts();
+  const byId = new Map<string, (typeof tail)[number][]>();
+  for (const el of tail) {
+    const key = String(el.mediaItemId);
+    byId.set(key, [...(byId.get(key) ?? []), el]);
+  }
+
+  const reordered = reorder(tail.map((el: any) => toTrack(String(el.mediaItemId), counts)));
+  const newTail = reordered.map((t) => byId.get(t.id)!.shift()!);
+
+  console.log(`[TrueShuffle] Re-ordered ${newTail.length} queued tracks using mode "${pluginSettings.mode}".`);
+  redux.actions['playQueue/RESET']({
+    ...pq,
+    elements: [...head, ...newTail],
+    currentIndex: pq.currentIndex,
+  });
+}
+
+// Detect every time Tidal applies a new shuffle (it stores the seed it used).
+let lastSeed = PlayState.playQueue.lastShuffleSeed;
+const unsubscribe = redux.store.subscribe(() => {
+  const seed = redux.store.getState().playQueue.lastShuffleSeed;
+  if (seed === lastSeed) return;
+  lastSeed = seed;
+  // Defer so we never dispatch from inside the store's own update cycle.
+  setTimeout(() => {
+    try {
+      applyCustomShuffle();
+    } catch (err) {
+      console.error('[TrueShuffle] Failed to apply custom shuffle.', err);
+    }
+  }, 0);
+});
+unloads.add(unsubscribe);
+
+// Count plays so Least/Most Played has something to work with.
+PlayState.onScrobble(unloads, (mediaItem) => {
+  const counts = getPlayCounts();
+  counts[String(mediaItem.id)] = (counts[String(mediaItem.id)] ?? 0) + 1;
+  try {
+    localStorage.setItem(PLAY_COUNTS_KEY, JSON.stringify(counts));
+  } catch {
+    /* storage full/unavailable: ignore */
+  }
+});
+
+console.log('[TrueShuffle] Plugin initialized; watching the play queue for shuffles.');
