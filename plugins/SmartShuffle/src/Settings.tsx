@@ -1,6 +1,12 @@
 import React, { useState } from 'react';
 
 export const pluginSettings = {
+  get enabled() {
+    return localStorage.getItem('smart_shuffle_enabled') !== 'false';
+  },
+  set enabled(val: boolean) {
+    localStorage.setItem('smart_shuffle_enabled', String(val));
+  },
   get mode() {
     return localStorage.getItem('smart_shuffle_mode') || 'true_random';
   },
@@ -34,14 +40,25 @@ export const pluginSettings = {
 };
 
 export function Settings() {
+  const [enabled, setEnabled] = useState(pluginSettings.enabled);
   const [mode, setMode] = useState(pluginSettings.mode);
   const [ratio, setRatio] = useState(pluginSettings.smartShuffleRatio);
-  const [sampleSize, setSampleSize] = useState(pluginSettings.smartSampleSize);
   const [exponent, setExponent] = useState(pluginSettings.playCountExponent);
   const [spacing, setSpacing] = useState(pluginSettings.artistSpacing);
 
   return (
     <div style={{ padding: '16px', display: 'flex', flexDirection: 'column', gap: '16px' }}>
+      <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontWeight: 'bold' }}>
+        <input
+          type="checkbox"
+          checked={enabled}
+          onChange={(e) => {
+            setEnabled(e.target.checked);
+            pluginSettings.enabled = e.target.checked;
+          }}
+        />
+        Re-order the queue when shuffling (turn off to use Tidal's normal shuffle)
+      </label>
       <div>
         <label style={{ display: 'block', marginBottom: '6px', fontWeight: 'bold' }}>
           Shuffle Algorithm Mode
@@ -63,7 +80,7 @@ export function Settings() {
           }}
         >
           <option value="true_random">True Random (Uniform Fisher-Yates)</option>
-          <option value="smart_shuffle">Smart Shuffle (recommendations not available yet, acts as True Random)</option>
+          <option value="smart_shuffle">Smart Shuffle (adds Tidal's playlist suggestions, experimental)</option>
           <option value="least_played">Least Played First (counts plays since install)</option>
           <option value="most_played">Most Played First (counts plays since install)</option>
           <option value="fun">Fun Mode (Artist Separated)</option>
@@ -84,25 +101,6 @@ export function Settings() {
             const val = Number(e.target.value);
             setRatio(val);
             pluginSettings.smartShuffleRatio = val;
-          }}
-          style={{ width: '100%' }}
-        />
-      </div>
-
-      <div>
-        <label style={{ display: 'block', marginBottom: '6px', fontWeight: 'bold' }}>
-          Smart Shuffle Seed Sample Size ({sampleSize} tracks)
-        </label>
-        <input
-          type="range"
-          min={1}
-          max={10}
-          step={1}
-          value={sampleSize}
-          onChange={(e) => {
-            const val = Number(e.target.value);
-            setSampleSize(val);
-            pluginSettings.smartSampleSize = val;
           }}
           style={{ width: '100%' }}
         />

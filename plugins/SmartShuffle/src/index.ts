@@ -29,7 +29,36 @@ function toTrack(mediaItemId: string, counts: Record<string, number>): Track {
   };
 }
 
-function reorder(tracks: Track[]): Track[] {
+/** Ask Tidal for "suggested tracks" for the playlist the queue came from. Returns [] on any failure. */
+async function fetchPlaylistSuggestions(playlistUUID: string, exclude: Set<string>): Promise<Track[]> {
+  try {
+    const res: any = await redux.interceptActionResp(
+      () => redux.actions['content/LOAD_PLAYLIST_SUGGESTED_MEDIA_ITEMS']({ playlistUUID, reset: true }),
+      unloads,
+      ['content/LOAD_PLAYLIST_SUGGESTED_MEDIA_ITEMS_SUCCESS'],
+      ['content/LOAD_PLAYLIST_SUGGESTED_MEDIA_ITEMS_FAIL'],
+      { timeoutMs: 8000 },
+    );
+    const recs: Track[] = [];
+    for (const m of res?.mediaItems ?? []) {
+      const item = m?.item;
+      if (m?.type !== 'track' || !item?.id || exclude.has(String(item.id))) continue;
+      recs.push({
+        id: String(item.id),
+        title: item.title ?? '',
+        artist: item.artist?.name ?? item.artists?.[0]?.name ?? '',
+        isRecommendation: true,
+      });
+    }
+    console.log(`[TrueShuffle] Tidal returned ${recs.length} usable suggestions for the playlist.`);
+    return recs;
+  } catch (err) {
+    console.warn('[TrueShuffle] Could not load playlist suggestions, falling back to plain shuffle.', err);
+    return [];
+  }
+}
+
+async function reorder(tracks: Track[], pq: any, excludeIds: Set<string>): Promise<Track[]> {
   switch (pluginSettings.mode) {
     case 'least_played':
       return ShuffleEngine.weightedShuffle(tracks, 'least_played', pluginSettings.playCountExponent);
@@ -37,9 +66,20 @@ function reorder(tracks: Track[]): Track[] {
       return ShuffleEngine.weightedShuffle(tracks, 'most_played', pluginSettings.playCountExponent);
     case 'fun':
       return ShuffleEngine.funShuffle(tracks, pluginSettings.artistSpacing);
-    case 'smart_shuffle':
-      // No recommendation API found in Luna, so this mode currently falls back to true random.
-      return ShuffleEngine.trueRandom(tracks);
+    case 'smart_shuffle': {
+      const isPlaylist = String(pq.sourceEntityType ?? '').toLowerCase() === 'playlist' && pq.sourceEntityId;
+      if (!isPlaylist) {
+        console.log('[TrueShuffle] Smart Shuffle only works when shuffling a playlist; using plain shuffle.');
+        return ShuffleEngine.trueRandom(tracks);
+      }
+      // The suggestions request doesn't take seed tracks, so the "seed sample size" isn't used.
+      return ShuffleEngine.smartShuffle(
+        tracks,
+        () => fetchPlaylistSuggestions(String(pq.sourceEntityId), excludeIds),
+        pluginSettings.smartShuffleRatio,
+        pluginSettings.smartSampleSize,
+      );
+    }
     case 'true_random':
     default:
       return ShuffleEngine.trueRandom(tracks);
@@ -50,7 +90,8 @@ function reorder(tracks: Track[]): Track[] {
  * Tidal shuffles the queue itself (seeded). When that happens we take the queue
  * after the current track and re-order it with the selected algorithm.
  */
-function applyCustomShuffle() {
+async function applyCustomShuffle(seed: number) {
+  if (!pluginSettings.enabled) return;
   const pq = PlayState.playQueue;
   if (!pq.shuffleModeEnabled) return;
 
@@ -64,16 +105,53 @@ function applyCustomShuffle() {
     const key = String(el.mediaItemId);
     byId.set(key, [...(byId.get(key) ?? []), el]);
   }
+  const queuedIds = new Set<string>(pq.elements.map((el: any) => String(el.mediaItemId)));
 
-  const reordered = reorder(tail.map((el: any) => toTrack(String(el.mediaItemId), counts)));
-  const newTail = reordered.map((t) => byId.get(t.id)!.shift()!);
+  const reordered = await reorder(
+    tail.map((el: any) => toTrack(String(el.mediaItemId), counts)),
+    pq,
+    queuedIds,
+  );
 
-  console.log(`[TrueShuffle] Re-ordered ${newTail.length} queued tracks using mode "${pluginSettings.mode}".`);
-  redux.actions['playQueue/RESET']({
-    ...pq,
-    elements: [...head, ...newTail],
-    currentIndex: pq.currentIndex,
+  // The suggestions request is async: if the user shuffled again meanwhile, drop this result.
+  if (PlayState.playQueue.lastShuffleSeed !== seed) {
+    console.log('[TrueShuffle] Queue changed while working, skipping this re-order.');
+    return;
+  }
+
+  // Split into queue tracks (re-ordered) and suggested tracks (inserted afterwards).
+  const newTail: any[] = [];
+  const inserts: { index: number; id: string }[] = [];
+  reordered.forEach((t, i) => {
+    if (t.isRecommendation) inserts.push({ index: head.length + i, id: t.id });
+    else newTail.push(byId.get(t.id)!.shift()!);
   });
+
+  const wasPlaying = PlayState.playing;
+  const current = PlayState.playQueue;
+  console.log(
+    `[TrueShuffle] Re-ordering ${newTail.length} queued tracks (+${inserts.length} suggestions) using mode "${pluginSettings.mode}" ` +
+      `(state=${PlayState.state}, desired=${PlayState.desiredState}, index=${current.currentIndex}).`,
+  );
+  redux.actions['playQueue/RESET']({
+    ...current,
+    elements: [...head, ...newTail],
+    currentIndex: current.currentIndex,
+  });
+
+  // Insert suggestions at their final positions, in ascending order so earlier inserts shift later ones correctly.
+  for (const { index, id } of inserts) {
+    redux.actions['playQueue/ADD_AT_INDEX']({ context: { type: 'UNKNOWN' }, mediaItemIds: [id], index });
+  }
+
+  // The reset can stop playback. If the user was playing, check shortly after and resume.
+  setTimeout(() => {
+    console.log(`[TrueShuffle] After reset: state=${PlayState.state}, desired=${PlayState.desiredState}.`);
+    if (wasPlaying && PlayState.state !== 'PLAYING') {
+      console.log('[TrueShuffle] Playback was stopped by the reset, resuming.');
+      PlayState.play();
+    }
+  }, 800);
 }
 
 // Detect every time Tidal applies a new shuffle (it stores the seed it used).
@@ -84,11 +162,7 @@ const unsubscribe = redux.store.subscribe(() => {
   lastSeed = seed;
   // Defer so we never dispatch from inside the store's own update cycle.
   setTimeout(() => {
-    try {
-      applyCustomShuffle();
-    } catch (err) {
-      console.error('[TrueShuffle] Failed to apply custom shuffle.', err);
-    }
+    applyCustomShuffle(seed).catch((err) => console.error('[TrueShuffle] Failed to apply custom shuffle.', err));
   }, 0);
 });
 unloads.add(unsubscribe);
